@@ -3,12 +3,13 @@ mod replication;
 mod upgrade;
 
 use crate::kanidm::get_dependency_version;
-use crate::test::{init_crypto_provider, wait_for};
+use crate::test::{init_crypto_provider, poll_until, wait_for};
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use kaniop_operator::controller::VERSION_LABEL;
 use kaniop_operator::kanidm::crd::Kanidm;
 use kaniop_operator::kanidm::reconcile::secret::SecretExt;
 use kaniop_operator::kanidm::reconcile::statefulset::StatefulSetExt;
@@ -85,6 +86,14 @@ pub fn is_kanidm_false(cond: &str) -> impl Condition<Kanidm> + '_ {
 fn is_statefulset_ready(obj: Option<&StatefulSet>) -> bool {
     obj.and_then(|statefulset| statefulset.status.as_ref())
         .is_some_and(|s| s.ready_replicas == Some(s.replicas))
+}
+
+fn statefulset_version_label(sts: &StatefulSet) -> Option<String> {
+    sts.metadata.labels.as_ref()?.get(VERSION_LABEL).cloned()
+}
+
+fn pod_version_label(pod: &Pod) -> Option<String> {
+    pod.metadata.labels.as_ref()?.get(VERSION_LABEL).cloned()
 }
 
 async fn create_secret(client: &Client, name: &str) {
@@ -238,7 +247,42 @@ async fn wait_for_replication_success_with_timeout(pod_api: &Api<Pod>, pod_names
 
 e2e_test!(kanidm_create, {
     let name = "test-create";
-    setup(name, None).await;
+    let s = setup(name, None).await;
+
+    let sts_name = format!("{name}-{DEFAULT_REPLICA_GROUP_NAME}");
+    let pod_name = format!("{sts_name}-0");
+
+    // The operator probes each pod's own X-KANIDM-VERSION header and records it on the CR
+    // status; that's the ground truth the app.kubernetes.io/version labels below must mirror.
+    let observed_version: String = poll_until("pod observed_server_version reported", || async {
+        let kanidm = s.kanidm_api.get(name).await.ok()?;
+        kanidm
+            .status?
+            .replica_statuses
+            .into_iter()
+            .find(|rs| rs.pod_name == pod_name)?
+            .observed_server_version
+    })
+    .await;
+
+    let pod_api = Api::<Pod>::namespaced(s.client.clone(), "default");
+    poll_until(
+        "pod app.kubernetes.io/version label matches observed version",
+        || async {
+            let pod = pod_api.get(&pod_name).await.ok()?;
+            (pod_version_label(&pod).as_ref() == Some(&observed_version)).then_some(())
+        },
+    )
+    .await;
+
+    poll_until(
+        "StatefulSet app.kubernetes.io/version label matches observed version",
+        || async {
+            let sts = s.statefulset_api.get(&sts_name).await.ok()?;
+            (statefulset_version_label(&sts).as_ref() == Some(&observed_version)).then_some(())
+        },
+    )
+    .await;
 });
 
 e2e_test!(kanidm_delete_statefulset, {

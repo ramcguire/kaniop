@@ -5,7 +5,7 @@ use super::{
     STORAGE_VOLUME_CLAIM_TEMPLATE_JSON, is_kanidm, is_kanidm_false, setup, wait_for,
     wait_for_replication_success_with_timeout,
 };
-use crate::test::wait_for_result;
+use crate::test::{poll_until, wait_for_result};
 
 use kaniop_operator::kanidm::crd::{
     Kanidm, KanidmReplicaGroupServices, KanidmReplicaState, ReplicaGroup,
@@ -645,6 +645,28 @@ e2e_test!(
         wait_for(s.kanidm_api.clone(), name, is_kanidm_false("Progressing")).await;
 
         wait_for_replication_success_with_timeout(&pod_api, &pod_names).await;
+
+        // Regression check: the server-version probe (status.rs) always targets the governing
+        // headless Service, never `replicationHostnameTemplate` — that template only promises
+        // the replication port is reachable at that host, often via a dedicated external-facing
+        // Service that doesn't forward the HTTPS API port at all. With a custom template set on
+        // the replica group above, the probe must keep resolving observed_server_version instead
+        // of trying to route through a host that was never meant to serve the API.
+        for pod_name in &pod_names {
+            poll_until(
+                "observed_server_version reported under custom replicationHostnameTemplate",
+                || async {
+                    let kanidm = s.kanidm_api.get(name).await.ok()?;
+                    kanidm
+                        .status?
+                        .replica_statuses
+                        .into_iter()
+                        .find(|rs| &rs.pod_name == pod_name)?
+                        .observed_server_version
+                },
+            )
+            .await;
+        }
     }
 );
 

@@ -1,7 +1,7 @@
 use super::secret::{REPLICA_SECRET_KEY, SecretExt};
 use super::service::ServiceExt;
 
-use crate::controller::cluster_domain;
+use crate::controller::{VERSION_LABEL, cluster_domain};
 use crate::kanidm::crd::{IpFamily, Kanidm, KanidmServerRole, ReplicaGroup, ReplicationType};
 
 use kaniop_k8s_util::error::Result;
@@ -24,6 +24,24 @@ pub const REPLICA_GROUP_LABEL: &str = "kanidm.kaniop.rs/replica-group";
 pub const REPLICA_LABEL: &str = "kanidm.kaniop.rs/replica";
 pub const CONTAINER_REPLICATION_PORT: i32 = 8444;
 pub const CONTAINER_REPLICATION_PORT_NAME: &str = "replication";
+
+/// Substitute `{pod_name}`, `{replica_index}`, `{domain}` placeholders in a
+/// `replicationHostnameTemplate`, used for the peer-facing `EXTERNAL_REPLICATION_NODE_HOST_*`
+/// init-container env vars. That template only promises the replication port is reachable at
+/// the resulting host (often via a dedicated external-facing Service) — it must not be reused
+/// for anything that needs the HTTPS API port, such as the server-version probe in `status.rs`,
+/// which always goes through the governing headless Service instead.
+fn render_replication_hostname_template(
+    template: &str,
+    pod_name: &str,
+    i: i32,
+    domain: &str,
+) -> String {
+    template
+        .replace("{pod_name}", pod_name)
+        .replace("{replica_index}", &i.to_string())
+        .replace("{domain}", domain)
+}
 
 // renovate: datasource=docker
 const REPLICATION_CONFIG_IMAGE: &str = "ghcr.io/rash-sh/rash:2.18.3";
@@ -83,7 +101,7 @@ const REPLICATION_CONFIG_SCRIPT: &str = r#"
     dest: "{{ env.KANIDM_CONFIG_PATH }}"
     mode: "0400"
 "#;
-const CONTAINER_HTTPS_PORT: i32 = 8443;
+pub(super) const CONTAINER_HTTPS_PORT: i32 = 8443;
 const CONTAINER_LDAP_PORT: i32 = 3636;
 pub(super) const KANIDM_CONFIG_PATH: &str = "/run/kanidm/server.toml";
 const VOLUME_CONFIG_NAME: &str = "kanidm-config";
@@ -101,7 +119,11 @@ pub trait StatefulSetExt {
     fn pod_name(&self, rg_name: &str, i: i32) -> String;
     fn pod_env_prefix(&self, pod_name: &str) -> String;
 
-    fn create_statefulset(&self, replica_group: &ReplicaGroup) -> Result<StatefulSet>;
+    fn create_statefulset(
+        &self,
+        replica_group: &ReplicaGroup,
+        version_label: Option<String>,
+    ) -> Result<StatefulSet>;
 }
 
 impl StatefulSetExt for Kanidm {
@@ -120,9 +142,13 @@ impl StatefulSetExt for Kanidm {
         pod_name.to_uppercase().replace("-", "_")
     }
 
-    fn create_statefulset(&self, replica_group: &ReplicaGroup) -> Result<StatefulSet> {
+    fn create_statefulset(
+        &self,
+        replica_group: &ReplicaGroup,
+        version_label: Option<String>,
+    ) -> Result<StatefulSet> {
         let pod_labels = self.generate_pod_labels(replica_group);
-        let labels = self.generate_sts_labels(&pod_labels);
+        let labels = self.generate_sts_labels(&pod_labels, version_label);
         let env = self.generate_env_vars(replica_group);
         let init_containers = self.generate_init_containers(replica_group)?;
         let ports = self.generate_container_ports();
@@ -199,8 +225,13 @@ impl Kanidm {
     fn generate_sts_labels(
         &self,
         pod_labels: &BTreeMap<String, String>,
+        version_label: Option<String>,
     ) -> BTreeMap<String, String> {
-        pod_labels.clone()
+        pod_labels
+            .clone()
+            .into_iter()
+            .chain(version_label.map(|version| (VERSION_LABEL.to_string(), version)))
+            .collect()
     }
 
     fn generate_env_vars(&self, replica_group: &ReplicaGroup) -> Vec<EnvVar> {
@@ -363,10 +394,12 @@ impl Kanidm {
                             .as_ref()
                             .and_then(|s| s.replication_hostname_template.as_ref())
                         {
-                            Some(template) => template
-                                .replace("{pod_name}", &pod_name)
-                                .replace("{replica_index}", &i.to_string())
-                                .replace("{domain}", &self.spec.domain),
+                            Some(template) => render_replication_hostname_template(
+                                template,
+                                &pod_name,
+                                i,
+                                &self.spec.domain,
+                            ),
                             None => format!(
                                 "{pod_name}.{}.{}.svc.{}",
                                 self.service_name(),
@@ -882,6 +915,34 @@ mod tests {
                 .any(|v| v.name == "kanidm-data" && v.empty_dir.is_some())
         );
         assert!(volume_claim_template.is_none());
+    }
+
+    #[test]
+    fn test_render_replication_hostname_template_substitutes_all_placeholders() {
+        use super::render_replication_hostname_template;
+
+        let rendered = render_replication_hostname_template(
+            "{pod_name}.repl.{domain}:{replica_index}",
+            "test-default-0",
+            2,
+            "example.com",
+        );
+
+        assert_eq!(rendered, "test-default-0.repl.example.com:2");
+    }
+
+    #[test]
+    fn test_render_replication_hostname_template_no_placeholders_is_passthrough() {
+        use super::render_replication_hostname_template;
+
+        let rendered = render_replication_hostname_template(
+            "static-host.example.com",
+            "pod-0",
+            0,
+            "example.com",
+        );
+
+        assert_eq!(rendered, "static-host.example.com");
     }
 }
 

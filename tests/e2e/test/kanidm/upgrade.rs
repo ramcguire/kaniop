@@ -2,10 +2,13 @@ use serial_test::serial;
 
 use super::{
     DEFAULT_REPLICA_GROUP_NAME, STORAGE_VOLUME_CLAIM_TEMPLATE_JSON, is_kanidm, is_kanidm_false,
-    is_statefulset_ready, setup, wait_for, wait_for_replication_success_with_timeout,
+    is_statefulset_ready, pod_version_label, setup, statefulset_version_label, wait_for,
+    wait_for_replication_success_with_timeout,
 };
 use crate::kanidm::get_dependency_version;
 use crate::test::poll_until;
+
+use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
 use json_patch::merge;
@@ -14,6 +17,7 @@ use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, Patch, PatchParams};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::time::{Instant, sleep};
 
 #[derive(Deserialize)]
 struct CratesVersionsResponse {
@@ -137,6 +141,17 @@ e2e_test!(
             .collect::<Vec<_>>();
         wait_for_replication_success_with_timeout(&pod_api, &pod_names).await;
 
+        // Baseline before the rollout starts: the version label should already be set from the
+        // initial (non-rolling) reconcile, giving us a known-good value to detect regressions
+        // (the label flipping to absent mid-rollout) against below.
+        let statefulset_api = s.statefulset_api.clone();
+        let pre_upgrade_version_label: String =
+            poll_until("StatefulSet version label set before upgrade", || async {
+                let sts = statefulset_api.get(&sts_name).await.ok()?;
+                statefulset_version_label(&sts)
+            })
+            .await;
+
         let kanidm_api = s.kanidm_api.clone();
         let retryable_patch = || async {
             let kanidm = kanidm_api.get(name).await?;
@@ -156,18 +171,35 @@ e2e_test!(
             .await
             .unwrap();
 
-        let statefulset_api = s.statefulset_api.clone();
-        let expected_image = current_image.clone();
-        poll_until("StatefulSet image updated", || async {
-            let sts = statefulset_api.get(&sts_name).await.ok()?;
+        // Regression test for the sticky, settled-rollout-gated StatefulSet version label: it
+        // must never go absent mid-rollout (a single pod not yet reporting its version used to
+        // wipe the label via SSA every reconcile) — it should only ever hold the pre-upgrade
+        // value until the rollout settles, then jump straight to the post-upgrade value.
+        let rollout_start = Instant::now();
+        loop {
+            assert!(
+                rollout_start.elapsed() < Duration::from_secs(120),
+                "Timed out waiting for StatefulSet image to update to {current_image}"
+            );
+            // Tolerate transient API server errors here (as poll_until does elsewhere in this
+            // suite) instead of failing the whole test on a single hiccup during the rollout.
+            let Ok(sts) = statefulset_api.get(&sts_name).await else {
+                sleep(Duration::from_secs(2)).await;
+                continue;
+            };
             let image = get_statefulset_image(&sts);
-            if image == expected_image {
-                Some(())
-            } else {
-                None
+            let label = statefulset_version_label(&sts);
+
+            assert!(
+                label.is_some(),
+                "StatefulSet version label disappeared mid-rollout (was {pre_upgrade_version_label})"
+            );
+
+            if image == current_image {
+                break;
             }
-        })
-        .await;
+            sleep(Duration::from_secs(2)).await;
+        }
 
         wait_for(s.kanidm_api.clone(), name, is_kanidm("Available")).await;
         wait_for(s.kanidm_api.clone(), name, is_kanidm_false("Progressing")).await;
@@ -178,5 +210,28 @@ e2e_test!(
         assert_eq!(upgraded_sts.spec.as_ref().unwrap().replicas.unwrap(), 2);
 
         wait_for_replication_success_with_timeout(&pod_api, &pod_names).await;
+
+        // Once settled, the label must advance past the pre-upgrade value (not just stay
+        // stuck), and every pod's own label must agree with the StatefulSet's.
+        let final_version_label: String = poll_until(
+            "StatefulSet version label settled to post-upgrade version",
+            || async {
+                let sts = statefulset_api.get(&sts_name).await.ok()?;
+                let label = statefulset_version_label(&sts)?;
+                (label != pre_upgrade_version_label).then_some(label)
+            },
+        )
+        .await;
+
+        for pod_name in &pod_names {
+            poll_until(
+                "Pod version label matches settled StatefulSet version label",
+                || async {
+                    let pod = pod_api.get(pod_name).await.ok()?;
+                    (pod_version_label(&pod).as_ref() == Some(&final_version_label)).then_some(())
+                },
+            )
+            .await;
+        }
     }
 );

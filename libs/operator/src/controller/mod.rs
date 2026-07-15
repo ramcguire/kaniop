@@ -11,7 +11,7 @@ use kaniop_k8s_util::error::{Error, Result};
 
 use kaniop_k8s_util::types::short_type_name;
 
-use std::fmt::Debug;
+use std::fmt::{Debug, Write};
 use std::sync::Arc;
 
 use futures::channel::mpsc;
@@ -35,6 +35,7 @@ use std::sync::OnceLock;
 
 const DEFAULT_IDM_RECONCILE_INTERVAL_SECS: u64 = 60;
 const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
+const OPENMETRICS_EOF: &str = "# EOF\n";
 
 static IDM_RECONCILE_INTERVAL: OnceLock<Duration> = OnceLock::new();
 static CLUSTER_DOMAIN: OnceLock<String> = OnceLock::new();
@@ -59,6 +60,7 @@ pub const RELOAD_BUFFER_SIZE: usize = 16;
 pub const NAME_LABEL: &str = "app.kubernetes.io/name";
 pub const INSTANCE_LABEL: &str = "app.kubernetes.io/instance";
 pub const MANAGED_BY_LABEL: &str = "app.kubernetes.io/managed-by";
+pub const VERSION_LABEL: &str = "app.kubernetes.io/version";
 
 pub type ControllerId = &'static str;
 
@@ -93,6 +95,20 @@ where
 }
 
 /// State wrapper around the controller outputs for the web server
+fn append_before_openmetrics_eof(metrics: &str, extra: &str) -> String {
+    match metrics.strip_suffix(OPENMETRICS_EOF) {
+        Some(body) => format!("{body}{extra}{OPENMETRICS_EOF}"),
+        None => format!("{metrics}{extra}"),
+    }
+}
+
+fn escape_prometheus_label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 impl State {
     pub fn new(
         metrics: metrics::Metrics,
@@ -112,9 +128,46 @@ impl State {
 
     /// Metrics getter
     pub fn metrics(&self) -> Result<String> {
-        prometheus_exporter::format_prometheus_metrics("kaniop").map_err(|e| {
-            Error::FormattingError(format!("failed to export metrics: {}", e), std::fmt::Error)
-        })
+        let mut metrics =
+            prometheus_exporter::format_prometheus_metrics("kaniop").map_err(|e| {
+                Error::FormattingError(format!("failed to export metrics: {}", e), std::fmt::Error)
+            })?;
+        let version_info = self.kanidm_version_info_metrics();
+        if !version_info.is_empty() {
+            metrics = append_before_openmetrics_eof(&metrics, &version_info);
+        }
+        Ok(metrics)
+    }
+
+    fn kanidm_version_info_metrics(&self) -> String {
+        let mut output = String::new();
+        for kanidm in self.kanidm_store.state() {
+            let namespace = ResourceExt::namespace(kanidm.as_ref()).unwrap_or_default();
+            let name = kanidm.name_any();
+            for rs in kanidm.status.iter().flat_map(|s| s.replica_statuses.iter()) {
+                let Some(version) = &rs.observed_server_version else {
+                    continue;
+                };
+                if output.is_empty() {
+                    writeln!(
+                        output,
+                        "# HELP kaniop_kanidm_version_info Kanidm server version reported by each pod."
+                    )
+                    .ok();
+                    writeln!(output, "# TYPE kaniop_kanidm_version_info gauge").ok();
+                }
+                writeln!(
+                    output,
+                    "kaniop_kanidm_version_info{{namespace=\"{}\",name=\"{}\",pod=\"{}\",version=\"{}\"}} 1",
+                    escape_prometheus_label_value(&namespace),
+                    escape_prometheus_label_value(&name),
+                    escape_prometheus_label_value(&rs.pod_name),
+                    escape_prometheus_label_value(version),
+                )
+                .ok();
+            }
+        }
+        output
     }
 
     /// Create a Controller Context that can update State

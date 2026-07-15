@@ -11,8 +11,8 @@ use k8s_openapi::api::core::v1::{
     VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, LabelSelector};
-use kube::api::ObjectMeta;
 use kube::CustomResource;
+use kube::api::ObjectMeta;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -463,12 +463,18 @@ pub struct MailSenderCredentialsSecret {
 
     /// Key in the secret containing the SMTP username.
     /// Defaults to "username".
-    #[serde(default = "default_smtp_username_key", skip_serializing_if = "is_default")]
+    #[serde(
+        default = "default_smtp_username_key",
+        skip_serializing_if = "is_default"
+    )]
     pub username_key: String,
 
     /// Key in the secret containing the SMTP password.
     /// Defaults to "password".
-    #[serde(default = "default_smtp_password_key", skip_serializing_if = "is_default")]
+    #[serde(
+        default = "default_smtp_password_key",
+        skip_serializing_if = "is_default"
+    )]
     pub password_key: String,
 }
 
@@ -1045,6 +1051,12 @@ pub struct KanidmReplicaStatus {
     /// StatefulSet name: Kanidm name plus the replica group name.
     pub statefulset_name: String,
 
+    /// The Kanidm server version reported by this specific pod's own
+    /// `X-KANIDM-VERSION` response header. `None` when the pod is not
+    /// reachable or has not answered yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_server_version: Option<String>,
+
     /// The current state of the replica.
     pub state: KanidmReplicaState,
 }
@@ -1167,5 +1179,37 @@ mod tests {
             status.compatibility_result,
             VersionCompatibilityResult::Compatible
         );
+    }
+
+    #[test]
+    fn test_kanidm_replica_status_backward_compatible() {
+        let legacy_payload = json!({
+            "podName": "test-default-0",
+            "statefulsetName": "test-default",
+            "state": "ready"
+        });
+
+        let status: KanidmReplicaStatus =
+            serde_json::from_value(legacy_payload).expect("legacy status should deserialize");
+
+        assert_eq!(status.observed_server_version, None);
+    }
+
+    #[test]
+    fn test_kanidm_replica_status_with_observed_server_version() {
+        let payload = json!({
+            "podName": "test-default-0",
+            "statefulsetName": "test-default",
+            "observedServerVersion": "1.10.0",
+            "state": "ready"
+        });
+
+        let status: KanidmReplicaStatus =
+            serde_json::from_value(payload).expect("status should deserialize");
+
+        assert_eq!(status.observed_server_version, Some("1.10.0".to_string()));
+
+        let serialized = serde_json::to_value(&status).expect("status should serialize");
+        assert_eq!(serialized["observedServerVersion"], "1.10.0");
     }
 }

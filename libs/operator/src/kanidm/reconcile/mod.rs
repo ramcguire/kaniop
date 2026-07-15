@@ -22,7 +22,7 @@ use self::status::StatusExt;
 use self::status::{is_kanidm_available, is_kanidm_initialized};
 
 use crate::controller::context::KubeOperations;
-use crate::controller::{INSTANCE_LABEL, MANAGED_BY_LABEL, NAME_LABEL};
+use crate::controller::{INSTANCE_LABEL, MANAGED_BY_LABEL, NAME_LABEL, VERSION_LABEL};
 use crate::kanidm::crd::{
     Kanidm, KanidmReplicaState, KanidmStatus, KanidmUpgradeCheckResult, VersionCompatibilityResult,
 };
@@ -50,6 +50,7 @@ use kube::api::{Api, AttachParams, Patch, PatchParams};
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event, EventType};
 use kube::runtime::finalizer::{Event as Finalizer, finalizer};
+use kube::runtime::reflector::ObjectRef;
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 use tracing::{Span, debug, field, info, instrument, trace, warn};
@@ -61,12 +62,20 @@ const STS_ROLLOUT_POLL_INTERVAL_SECONDS: u64 = 2;
 const CERT_SHOW_RETRY_ATTEMPTS: u32 = 6;
 const CERT_SHOW_INITIAL_DELAY_SECONDS: u64 = 15;
 const CERT_SHOW_RETRY_DELAY_SECONDS: u64 = 15;
+// Matches the connect/request timeout budget used for the version probe itself
+// (`fetch_observed_server_version`), so a stalled apiserver can't hang this best-effort step.
+const LABEL_PATCH_TIMEOUT_SECONDS: u64 = 5;
 
 pub const CLUSTER_LABEL: &str = "kanidm.kaniop.rs/cluster";
 const KANIDM_OPERATOR_NAME: &str = "kanidms.kaniop.rs";
 pub static KANIDM_FINALIZER: &str = "kanidms.kaniop.rs/finalizer";
 
 const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+// The version probe can miss a freshly-started pod (DNS/TLS not ready yet) with no owned-resource
+// event left to naturally retry it once the StatefulSet/Pod settle. Requeue soon instead of
+// waiting for DEFAULT_RECONCILE_INTERVAL so an incomplete probe keeps getting retried until every
+// replica has a known version.
+const VERSION_PROBE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 static LABELS: LazyLock<BTreeMap<String, String>> = LazyLock::new(|| {
     BTreeMap::from([
@@ -77,6 +86,189 @@ static LABELS: LazyLock<BTreeMap<String, String>> = LazyLock::new(|| {
         ),
     ])
 });
+
+/// A Kubernetes label value must be empty, or 1-63 chars of alphanumerics, `-`, `_`, `.`,
+/// starting and ending with an alphanumeric.
+fn is_valid_label_value(value: &str) -> bool {
+    if value.is_empty() {
+        return true;
+    }
+    if value.len() > 63 {
+        return false;
+    }
+    let first = value.chars().next().expect("checked non-empty above");
+    let last = value.chars().next_back().expect("checked non-empty above");
+    first.is_ascii_alphanumeric()
+        && last.is_ascii_alphanumeric()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Compute the `app.kubernetes.io/version` label value for one replica group
+/// from the per-pod versions observed in `replica_statuses`.
+///
+/// Returns `Some(version)` only when the StatefulSet's rollout has settled
+/// (`StatefulSetStatus.current_revision == update_revision`) *and* every pod
+/// belonging to `statefulset_name` agrees on the same version. Returns `None`
+/// otherwise; the caller is expected to simply skip patching in that case and
+/// let the previously-applied label stand so the label only ever advances to a
+/// newly-confirmed version.
+fn statefulset_version_label(
+    replica_statuses: &[crate::kanidm::crd::KanidmReplicaStatus],
+    statefulset_name: &str,
+    rollout_settled: bool,
+) -> Option<String> {
+    if !rollout_settled {
+        return None;
+    }
+
+    let mut versions = replica_statuses
+        .iter()
+        .filter(|rs| rs.statefulset_name == statefulset_name)
+        .map(|rs| rs.observed_server_version.as_deref());
+
+    let first = match versions.next() {
+        Some(Some(v)) => v,
+        _ => return None,
+    };
+
+    (is_valid_label_value(first) && versions.all(|v| v == Some(first))).then(|| first.to_string())
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::{is_valid_label_value, statefulset_version_label};
+    use crate::kanidm::crd::{KanidmReplicaState, KanidmReplicaStatus};
+
+    #[test]
+    fn test_is_valid_label_value_accepts_valid_values() {
+        assert!(is_valid_label_value(""));
+        assert!(is_valid_label_value("1.10.0"));
+        assert!(is_valid_label_value("v1.10.0-rc1"));
+        assert!(is_valid_label_value("a"));
+        assert!(is_valid_label_value(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn test_is_valid_label_value_rejects_invalid_values() {
+        assert!(!is_valid_label_value("-leading-dash"));
+        assert!(!is_valid_label_value("trailing-dash-"));
+        assert!(!is_valid_label_value(&"a".repeat(64)));
+        assert!(!is_valid_label_value("has space"));
+        assert!(!is_valid_label_value("has/slash"));
+    }
+
+    fn replica(statefulset_name: &str, version: Option<&str>) -> KanidmReplicaStatus {
+        KanidmReplicaStatus {
+            pod_name: format!("{statefulset_name}-0"),
+            statefulset_name: statefulset_name.to_string(),
+            observed_server_version: version.map(str::to_string),
+            state: KanidmReplicaState::Ready,
+        }
+    }
+
+    #[test]
+    fn test_statefulset_version_label_when_settled_and_all_pods_agree() {
+        let statuses = vec![
+            replica("test-default", Some("1.10.0")),
+            replica("test-default", Some("1.10.0")),
+        ];
+        assert_eq!(
+            statefulset_version_label(&statuses, "test-default", true),
+            Some("1.10.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_statefulset_version_label_none_when_not_settled_even_if_pods_agree() {
+        let statuses = vec![
+            replica("test-default", Some("1.10.0")),
+            replica("test-default", Some("1.10.0")),
+        ];
+        assert_eq!(
+            statefulset_version_label(&statuses, "test-default", false),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_statefulset_version_label_none_when_pods_disagree() {
+        let statuses = vec![
+            replica("test-default", Some("1.10.0")),
+            replica("test-default", Some("1.9.0")),
+        ];
+        assert_eq!(
+            statefulset_version_label(&statuses, "test-default", true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_statefulset_version_label_none_when_unknown() {
+        let statuses = vec![replica("test-default", None)];
+        assert_eq!(
+            statefulset_version_label(&statuses, "test-default", true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_statefulset_version_label_none_when_no_pods() {
+        assert_eq!(statefulset_version_label(&[], "test-default", true), None);
+    }
+
+    #[test]
+    fn test_statefulset_version_label_ignores_other_statefulsets() {
+        let statuses = vec![replica("test-other", Some("1.10.0"))];
+        assert_eq!(
+            statefulset_version_label(&statuses, "test-default", true),
+            None
+        );
+    }
+}
+
+/// Apply a single `app.kubernetes.io/version` label onto a namespaced resource with
+/// server-side apply, using the standard Kanidm field manager. The patch only contains the
+/// one metadata label, so the operator owns that label without touching unrelated metadata.
+async fn apply_single_label<K>(ctx: Arc<Context>, namespace: String, name: String, version: String)
+where
+    K: Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + std::fmt::Debug
+        + for<'de> Deserialize<'de>,
+    <K as Resource>::DynamicType: Default,
+{
+    let dynamic_type = <K as Resource>::DynamicType::default();
+    let patch = serde_json::json!({
+        "apiVersion": K::api_version(&dynamic_type),
+        "kind": K::kind(&dynamic_type),
+        "metadata": {
+            "name": &name,
+            "namespace": &namespace,
+            "labels": {
+                VERSION_LABEL: version,
+            }
+        }
+    });
+    let result = tokio::time::timeout(
+        Duration::from_secs(LABEL_PATCH_TIMEOUT_SECONDS),
+        Api::<K>::namespaced(ctx.kaniop_ctx.client.clone(), &namespace).patch(
+            &name,
+            &PatchParams::apply(KANIDM_OPERATOR_NAME).force(),
+            &Patch::Apply(&patch),
+        ),
+    )
+    .await;
+    match result {
+        Ok(Err(e)) => debug!(msg = "failed to apply version label", namespace, name, %e),
+        Err(_) => debug!(
+            msg = "timed out applying version label",
+            namespace, name, LABEL_PATCH_TIMEOUT_SECONDS
+        ),
+        Ok(Ok(_)) => {}
+    }
+}
 
 async fn restart_statefulsets_after_replica_secret_update(
     ctx: Arc<Context>,
@@ -488,7 +680,25 @@ async fn reconcile(kanidm: Arc<Kanidm>, ctx: Arc<Context>, status: KanidmStatus)
             .replica_groups
             .iter()
             .map(|rg| {
-                let sts = kanidm.create_statefulset(rg)?;
+                let sts_name = kanidm.statefulset_name(&rg.name);
+                let sts_ref = ObjectRef::<StatefulSet>::new_with(&sts_name, ())
+                    .within(&kanidm.get_namespace());
+                let current_sts = ctx.stores.stateful_set_store.get(&sts_ref);
+                let rollout_settled = current_sts
+                    .as_ref()
+                    .and_then(|sts| sts.status.clone())
+                    .is_some_and(|s| {
+                        s.current_revision.is_some() && s.current_revision == s.update_revision
+                    });
+                let version_label =
+                    statefulset_version_label(&status.replica_statuses, &sts_name, rollout_settled)
+                        .or_else(|| {
+                            current_sts
+                                .as_ref()
+                                .and_then(|sts| sts.metadata.labels.as_ref())
+                                .and_then(|labels| labels.get(VERSION_LABEL).cloned())
+                        });
+                let sts = kanidm.create_statefulset(rg, version_label)?;
                 Ok(kanidm.patch(&ctx, sts))
             })
             .collect::<Result<TryJoinAll<_>, _>>()?,
@@ -682,6 +892,25 @@ async fn reconcile(kanidm: Arc<Kanidm>, ctx: Arc<Context>, status: KanidmStatus)
         backend_tls_policy_futures
     )?;
 
+    // Best-effort: a pod not answering (yet) or a transient patch failure must never fail the
+    // whole reconcile, so this stays outside the `try_join!` above and swallows its own errors.
+    // StatefulSet version labels are included in the normal StatefulSet SSA above, with sticky
+    // preservation while a rollout is unsettled or a version probe is temporarily missing.
+    join_all(status.replica_statuses.iter().filter_map(|rs| {
+        rs.observed_server_version
+            .as_deref()
+            .filter(|v| is_valid_label_value(v))
+            .map(|version| {
+                apply_single_label::<Pod>(
+                    ctx.clone(),
+                    kanidm.get_namespace(),
+                    rs.pod_name.clone(),
+                    version.to_string(),
+                )
+            })
+    }))
+    .await;
+
     if is_kanidm_available(status.clone()) {
         let namespace = kanidm.namespace().unwrap();
         let name = kanidm.name_any();
@@ -724,7 +953,17 @@ async fn reconcile(kanidm: Arc<Kanidm>, ctx: Arc<Context>, status: KanidmStatus)
         }
     }
 
-    Ok(Action::requeue(DEFAULT_RECONCILE_INTERVAL))
+    let requeue_after = if status
+        .replica_statuses
+        .iter()
+        .any(|rs| rs.observed_server_version.is_none())
+    {
+        VERSION_PROBE_RETRY_INTERVAL
+    } else {
+        DEFAULT_RECONCILE_INTERVAL
+    };
+
+    Ok(Action::requeue(requeue_after))
 }
 
 async fn cleanup(kanidm: Arc<Kanidm>, ctx: Arc<Context>) -> Result<Action> {

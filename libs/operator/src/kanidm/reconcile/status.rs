@@ -1,6 +1,8 @@
 use super::secret::{SECRET_TYPE_LABEL, SecretExt, SecretType};
-use super::statefulset::StatefulSetExt;
+use super::service::ServiceExt;
+use super::statefulset::{CONTAINER_HTTPS_PORT, StatefulSetExt};
 
+use crate::controller::cluster_domain;
 use crate::kanidm::controller::context::Context;
 use crate::kanidm::crd::{
     DomainAppearanceImageStatus, Kanidm, KanidmReplicaState, KanidmReplicaStatus, KanidmStatus,
@@ -9,7 +11,7 @@ use crate::kanidm::crd::{
 use crate::version;
 use kaniop_k8s_util::error::{Error, Result};
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -17,6 +19,8 @@ use k8s_openapi::api::apps::v1::{StatefulSet, StatefulSetStatus};
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::jiff::Timestamp;
+use kanidm_client::{KanidmClient, KanidmClientBuilder};
+use kanidm_proto::constants::KVERSION;
 use kaniop_k8s_util::resources::get_image_tag;
 use kube::Resource;
 use kube::ResourceExt;
@@ -101,6 +105,9 @@ impl StatusExt for Kanidm {
             .get(&secret_ref)
             .map(|s| s.name_any());
 
+        let service_name = self.service_name();
+        // Skip the version probe once deletion has started
+        let is_deleting = self.meta().deletion_timestamp.is_some();
         let replica_infos_futures: Vec<_> = statefulsets
             .iter()
             .flat_map(|sts| {
@@ -108,6 +115,7 @@ impl StatusExt for Kanidm {
                 let secret_store = ctx.stores.secret_store.clone();
                 let ctx_clone = ctx.clone();
                 let namespace = namespace.to_string();
+                let service_name = service_name.clone();
 
                 (0..replicas).map(move |i| {
                     let sts_name = sts.name_any();
@@ -125,6 +133,14 @@ impl StatusExt for Kanidm {
 
                     let secret_ref =
                         ObjectRef::<Secret>::new_with(&secret_name, ()).within(&namespace);
+
+                    // Probe through the governing Service. `replicationHostnameTemplate` may only
+                    // expose the replication port, not the HTTPS API used here.
+                    let pod_host = if self.is_replication_enabled() {
+                        format!("{pod_name}.{service_name}.{namespace}.svc.{}", cluster_domain())
+                    } else {
+                        format!("{service_name}.{namespace}.svc.{}", cluster_domain())
+                    };
 
                     async move {
                         let replica_secret = secret_store.get(&secret_ref);
@@ -169,12 +185,22 @@ impl StatusExt for Kanidm {
                                 trace!(msg = format!("replica cert host {h}, expected host {:?}, matches {matches}", replication_host));
                                 matches
                             });
+
+                        // Only observed here; the actual `app.kubernetes.io/version` write
+                        // happens in `reconcile()` so status computation stays pure
+                        let observed_server_version = if is_deleting {
+                            None
+                        } else {
+                            fetch_observed_server_version(&pod_host).await
+                        };
+
                         ReplicaInformation {
                             pod_name,
                             statefulset_name: sts_name.clone(),
                             replica_secret_exists: replica_secret.is_some(),
                             is_certificate_expiring,
                             is_certificate_host_valid,
+                            observed_server_version,
                         }
                     }
                 })
@@ -343,12 +369,64 @@ impl Kanidm {
     }
 }
 
+/// Shared HTTP client used to probe pod server versions across reconciles.
+/// The builder requires an address, but individual requests use per-pod URLs.
+static VERSION_PROBE_CLIENT: LazyLock<Option<KanidmClient>> = LazyLock::new(|| {
+    KanidmClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        // Pod DNS names do not match the configured Kanidm domain in the cert SAN.
+        .danger_accept_invalid_hostnames(true)
+        .connect_timeout(5)
+        .request_timeout(5)
+        .address(format!("https://localhost:{CONTAINER_HTTPS_PORT}"))
+        .build()
+        .map_err(|e| {
+            warn!(
+                msg = "failed to build shared HTTP client for server version check",
+                ?e
+            )
+        })
+        .ok()
+});
+
+/// Read a pod's authoritative Kanidm version from `X-KANIDM-VERSION`.
+/// Uses `/v1/domain` because `/status` bypasses the version-header middleware.
+/// Avoids `kanidm_client` request helpers because they enforce client/server version equality.
+async fn fetch_observed_server_version(host: &str) -> Option<String> {
+    let kanidm_client = VERSION_PROBE_CLIENT.as_ref()?;
+
+    let response = kanidm_client
+        .client()
+        .get(format!("https://{host}:{CONTAINER_HTTPS_PORT}/v1/domain"))
+        .send()
+        .await
+        .map_err(|e| {
+            debug!(
+                msg = "failed to reach Kanidm host for server version check",
+                host,
+                ?e
+            )
+        })
+        .ok()?;
+
+    parse_version_header(response.headers())
+}
+
+fn parse_version_header(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(KVERSION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
+}
+
 struct ReplicaInformation {
     pod_name: String,
     statefulset_name: String,
     replica_secret_exists: bool,
     is_certificate_expiring: Option<bool>,
     is_certificate_host_valid: Option<bool>,
+    observed_server_version: Option<String>,
 }
 
 pub fn is_kanidm_available(status: KanidmStatus) -> bool {
@@ -395,6 +473,7 @@ fn generate_status(
         .map(|ri| KanidmReplicaStatus {
             pod_name: ri.pod_name.clone(),
             statefulset_name: ri.statefulset_name.clone(),
+            observed_server_version: ri.observed_server_version.clone(),
             state: if ri.replica_secret_exists || !is_replication_enabled {
                 if ri.is_certificate_expiring == Some(true) {
                     debug!(msg = format!("replica cert is expiring for pod {}", ri.pod_name));
@@ -638,6 +717,26 @@ fn update_conditions(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_parse_version_header_present() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(KVERSION, "1.10.0".parse().unwrap());
+        assert_eq!(parse_version_header(&headers), Some("1.10.0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_version_header_missing() {
+        let headers = http::HeaderMap::new();
+        assert_eq!(parse_version_header(&headers), None);
+    }
+
+    #[test]
+    fn test_parse_version_header_empty() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(KVERSION, "".parse().unwrap());
+        assert_eq!(parse_version_header(&headers), None);
+    }
 
     fn create_condition(type_: &str, status: &str) -> Condition {
         Condition {

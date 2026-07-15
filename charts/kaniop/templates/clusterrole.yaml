@@ -24,11 +24,16 @@ rules:
       - ""
     resources:
       - pods
-      - pods/exec
     verbs:
       - get
       - list
       - watch
+      - patch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/exec
+    verbs:
       - create
   - apiGroups:
       - ""
